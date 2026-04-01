@@ -195,12 +195,20 @@ verifier treats those as valid matches for the canonical `query_key_value_proj`.
   - Script: `awex/tests/experimental/compare_megatron_vllm_weights.py`
   - Note: We default to mbridge for all models. Use `--no-mbridge` to force the
     Megatron convert.py path (Qwen3 will still fall back to mbridge).
+  - Note: The Megatron-side conversion depends on the target infer config.
+    For models whose vLLM runtime uses non-default settings (for example
+    `router_dtype=fp32` on MiniMax, or NPU-specific layouts), pass
+    `--infer-router-dtype`, `--infer-expert-bias-dtype`,
+    `--infer-device-backend`, and
+    `--infer-atten-tp-size` explicitly so the compare script uses the same
+    assumptions as the real infer runtime.
   - Example:
     ```bash
     python awex/tests/experimental/compare_megatron_vllm_weights.py \
       --model-path /path/to/hf/model \
       --out-dir /tmp/megatron_vllm_compare \
       --device-backend cuda \
+      --infer-device-backend cuda \
       --trust-remote-code \
       --max-layers 4 \
       --include-non-layer
@@ -214,6 +222,7 @@ verifier treats those as valid matches for the canonical `query_key_value_proj`.
         --model-path /path/to/hf/model \
         --out-dir /tmp/megatron_vllm_compare \
         --device-backend cuda \
+        --infer-device-backend cuda \
         --train-tp-size 2 \
         --train-pp-size 1 \
         --train-ep-size 1 \
@@ -225,7 +234,9 @@ verifier treats those as valid matches for the canonical `query_key_value_proj`.
       ```
 
 Both scripts produce a JSON report with missing keys, shape/dtype mismatches,
-and value diffs. You can limit comparison to the first N layers with
+value diffs, plus the requested-vs-observed infer config summary. If the script
+warns about infer config mismatch, update the explicit `--infer-*` flags before
+interpreting dtype/shape differences. You can limit comparison to the first N layers with
 `--max-layers N`. For large models, expect heavy disk usage because each tensor
 is saved to disk for comparison.
 
@@ -249,6 +260,7 @@ is saved to disk for comparison.
     CUDA_VISIBLE_DEVICES=0,1 python awex/tests/weights_exchange_vllm_it.py \
       --comm_backend nccl \
       --model-path /path/to/hf/model \
+      --trust-remote-code \
       --device-backend cuda \
       --validate
     ```
@@ -261,8 +273,13 @@ is saved to disk for comparison.
     ASCEND_RT_VISIBLE_DEVICES=0,1 AWEX_USE_MINDSPEED=1 \
       python awex/tests/weights_exchange_vllm_it.py \
       --comm_backend hccl \
+      --trust-remote-code \
       --device-backend npu
     ```
+  - For custom HF model code, add `--trust-remote-code`. Megatron-side test
+    setup already resolves the HF config with `trust_remote_code=True`; this
+    flag is specifically needed to forward the same requirement to the vLLM
+    server subprocess.
   - Multi-process (`torchrun`) integration is currently excluded because startup
     is not stable in our test environment. Use the single-process script above
     as the baseline validation path.

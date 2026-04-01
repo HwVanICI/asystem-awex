@@ -8,7 +8,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
 
 
 def _apply_device_backend(device_backend: str) -> str:
@@ -25,6 +24,107 @@ def _dist_backend_for(device_type: str) -> str:
     if device_type == "cuda":
         return "nccl"
     return "gloo"
+
+
+def _maybe_init_vllm_ascend_runtime(device_type: str, vllm_config) -> None:
+    if device_type != "npu":
+        return
+
+    try:
+        from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.distributed.parallel_state import (
+            init_ascend_model_parallel,
+        )
+        from vllm_ascend.utils import (
+            check_ascend_device_type,
+            register_ascend_customop,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "device_backend=npu requires vllm_ascend runtime initialization"
+        ) from exc
+
+    register_ascend_customop(vllm_config)
+    init_ascend_config(vllm_config)
+    check_ascend_device_type()
+    init_ascend_model_parallel(vllm_config.parallel_config)
+
+
+def _resolve_requested_infer_device_backend(
+    args: argparse.Namespace, runtime_device_backend: str
+) -> str:
+    return args.infer_device_backend or runtime_device_backend
+
+
+def _resolve_requested_router_dtype(args: argparse.Namespace, hf_config) -> str:
+    return args.infer_router_dtype or getattr(hf_config, "router_dtype", "bf16")
+
+
+def _resolve_requested_expert_bias_dtype(args: argparse.Namespace, hf_config) -> str:
+    return args.infer_expert_bias_dtype or _resolve_requested_router_dtype(
+        args, hf_config
+    )
+
+
+def _build_requested_infer_conf(
+    args: argparse.Namespace,
+    hf_config,
+    default_infer_atten_tp_size: int,
+    runtime_device_backend: str,
+) -> dict:
+    infer_device_backend = _resolve_requested_infer_device_backend(
+        args, runtime_device_backend
+    )
+    return {
+        "engine_name": "vllm",
+        "infer_atten_tp_size": (
+            args.infer_atten_tp_size
+            if args.infer_atten_tp_size is not None
+            else default_infer_atten_tp_size
+        ),
+        "router_dtype": _resolve_requested_router_dtype(args, hf_config),
+        "expert_bias_dtype": _resolve_requested_expert_bias_dtype(args, hf_config),
+        "num_query_groups": getattr(
+            hf_config, "num_key_value_heads", hf_config.num_attention_heads
+        ),
+        "device_backend": infer_device_backend,
+        "infer_engine_config": {
+            "device_backend": infer_device_backend,
+            "comm_backend": _dist_backend_for(infer_device_backend),
+        },
+    }
+
+
+def _observe_vllm_infer_conf(model, rank_info, runtime_device_backend: str) -> dict:
+    router_dtype = None
+    expert_bias_dtype = None
+    for name, param in model.named_parameters():
+        if name.endswith(".gate.weight") or ".gate.weight" in name:
+            router_dtype = str(param.dtype).removeprefix("torch.")
+        elif name.endswith(".expert_bias") or ".expert_bias" in name:
+            expert_bias_dtype = str(param.dtype).removeprefix("torch.")
+        if router_dtype is not None and expert_bias_dtype is not None:
+            break
+    return {
+        "engine_name": "vllm",
+        "infer_atten_tp_size": rank_info.attn_tp_size,
+        "router_dtype": router_dtype,
+        "expert_bias_dtype": expert_bias_dtype,
+        "device_backend": runtime_device_backend,
+    }
+
+
+def _compare_infer_conf(requested: dict, observed: dict) -> dict[str, dict[str, str]]:
+    mismatches = {}
+    for key, requested_value in requested.items():
+        observed_value = observed.get(key)
+        if observed_value is None or str(requested_value) != str(observed_value):
+            mismatches[key] = {
+                "requested": str(requested_value),
+                "observed": str(observed_value),
+            }
+    return mismatches
+
 
 
 def _hash_name(name: str) -> str:
@@ -64,7 +164,7 @@ def _load_manifest(manifest_path: Path) -> dict[str, dict]:
     return {entry["name"]: entry for entry in entries}
 
 
-def _parse_devices(arg: Optional[str]) -> List[int]:
+def _parse_devices(arg: str | None) -> list[int]:
     if not arg:
         return []
     return [int(x) for x in arg.split(",") if x.strip()]
@@ -76,6 +176,13 @@ def _maybe_get_tf_config(model):
         if cfg is not None:
             return cfg
     return None
+
+
+def _get_model_arch_name(hf_config) -> str:
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures:
+        return architectures[0]
+    raise ValueError("HF config must define architectures[0] for converter lookup.")
 
 
 def _setup_distributed():
@@ -95,8 +202,8 @@ def _setup_distributed():
 
 
 def _pick_train_devices(
-    world_size: int, visible_devices: List[int], train_devices_arg: Optional[str]
-) -> List[int]:
+    world_size: int, visible_devices: list[int], train_devices_arg: str | None
+) -> list[int]:
     train_devices = _parse_devices(train_devices_arg)
     if not train_devices:
         if len(visible_devices) < world_size:
@@ -124,7 +231,8 @@ def _dump_megatron_hf_weights_multi(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
-    from awex.converter.mcore_converter import McoreToHFWeightConverter
+    from awex.converter.mcore_converter import get_mcore_model_parameters
+    from awex.models.registry import get_train_weights_converter
     from awex.sharding.mcore_sharding import get_mcore_rank_info
     from awex.tests.test_utils import megatron_model_from_hf
     from awex.util import device as device_util
@@ -170,14 +278,24 @@ def _dump_megatron_hf_weights_multi(args: argparse.Namespace) -> None:
         model_path=args.model_path,
         use_mbridge=not args.no_mbridge,
     )
+    model_arch_name = _get_model_arch_name(hf_config)
 
     rank_info = get_mcore_rank_info()
-    infer_conf = {
-        "infer_atten_tp_size": rank_info.attn_tp_size,
-        "num_query_groups": getattr(
-            hf_config, "num_key_value_heads", hf_config.num_attention_heads
-        ),
-    }
+    infer_attn_tp_size = (
+        args.infer_atten_tp_size
+        if args.infer_atten_tp_size is not None
+        else (
+            args.vllm_tp_size
+            if args.vllm_tp_size is not None
+            else rank_info.attn_tp_size
+        )
+    )
+    infer_conf = _build_requested_infer_conf(
+        args,
+        hf_config,
+        default_infer_atten_tp_size=infer_attn_tp_size,
+        runtime_device_backend=device_util.get_device_type(),
+    )
 
     out_dir = Path(args.out_dir).resolve()
     rank_dir = out_dir / f"megatron_rank_{rank}"
@@ -190,13 +308,15 @@ def _dump_megatron_hf_weights_multi(args: argparse.Namespace) -> None:
     with torch.no_grad():
         for model in models:
             tf_config = _maybe_get_tf_config(model)
-            converter = McoreToHFWeightConverter(
+            converter = get_train_weights_converter(
+                "mcore",
+                model_arch_name,
                 hf_config,
                 rank_info,
-                infer_conf=infer_conf,
+                infer_conf,
                 tf_config=tf_config,
             )
-            for name, param in model.named_parameters():
+            for name, param in get_mcore_model_parameters(model).items():
                 converted = converter.convert_param(name, param.detach())
                 for hf_name, hf_tensor in converted:
                     if not _should_include_name(
@@ -294,7 +414,7 @@ def _compare_with_vllm(args: argparse.Namespace) -> None:
     from vllm.model_executor.model_loader import get_model
 
     from awex.config import InferenceConfig
-    from awex.converter.vllm_converter import VLLMToHFWeightConverter
+    from awex.models.registry import get_infer_weights_converter
     from awex.sharding.rank_info import RankInfo
     from awex.util import device as device_util
 
@@ -321,6 +441,7 @@ def _compare_with_vllm(args: argparse.Namespace) -> None:
     hf_config = AutoConfig.from_pretrained(
         args.model_path, trust_remote_code=args.trust_remote_code
     )
+    model_arch_name = _get_model_arch_name(hf_config)
     tp_size = (
         args.vllm_tp_size
         if args.vllm_tp_size is not None
@@ -385,7 +506,13 @@ def _compare_with_vllm(args: argparse.Namespace) -> None:
         engine_rank=rank,
         is_infer=True,
     )
-    converter = VLLMToHFWeightConverter(hf_config, infer_config, rank_info)
+    converter = get_infer_weights_converter(
+        "vllm",
+        model_arch_name,
+        hf_config,
+        rank_info,
+        infer_config,
+    )
 
     if device_util.device_count() > 0:
         try:
@@ -412,7 +539,36 @@ def _compare_with_vllm(args: argparse.Namespace) -> None:
         ),
     )
 
+    _maybe_init_vllm_ascend_runtime(device_util.get_device_type(), vllm_config)
     model = get_model(vllm_config=vllm_config)
+    requested_infer_conf = _build_requested_infer_conf(
+        args,
+        hf_config,
+        default_infer_atten_tp_size=rank_info.attn_tp_size,
+        runtime_device_backend=device_util.get_device_type(),
+    )
+    observed_infer_conf = _observe_vllm_infer_conf(
+        model, rank_info, device_util.get_device_type()
+    )
+    infer_conf_mismatch = _compare_infer_conf(
+        {
+            "engine_name": requested_infer_conf["engine_name"],
+            "infer_atten_tp_size": requested_infer_conf["infer_atten_tp_size"],
+            "router_dtype": requested_infer_conf["router_dtype"],
+            "expert_bias_dtype": requested_infer_conf["expert_bias_dtype"],
+            "device_backend": requested_infer_conf["device_backend"],
+        },
+        observed_infer_conf,
+    )
+    if infer_conf_mismatch:
+        print(
+            f"[rank {rank}] Infer config mismatch detected: {infer_conf_mismatch}"
+        )
+        print(
+            f"[rank {rank}] Hint: set --infer-router-dtype / "
+            "--infer-expert-bias-dtype / --infer-device-backend / --infer-atten-tp-size to match the real "
+            "vLLM runtime before interpreting dtype or shape mismatches."
+        )
 
     if os.environ.get("AWEX_DEBUG_VLLM_PARAMS", "0") == "1":
         raw_names = [name for name, _ in model.named_parameters()]
@@ -527,6 +683,11 @@ def _compare_with_vllm(args: argparse.Namespace) -> None:
             ]
 
     report = {
+        "infer_conf": {
+            "requested": requested_infer_conf,
+            "observed": observed_infer_conf,
+            "mismatch": infer_conf_mismatch,
+        },
         "missing_in_megatron": missing_in_megatron,
         "missing_in_vllm": missing_in_vllm,
         "shape_mismatch": shape_mismatch,
@@ -622,6 +783,14 @@ def _run_subprocess(stage: str, args: argparse.Namespace) -> None:
         "--atol",
         str(args.atol),
     ]
+    if args.infer_router_dtype:
+        cmd.extend(["--infer-router-dtype", args.infer_router_dtype])
+    if args.infer_expert_bias_dtype:
+        cmd.extend(["--infer-expert-bias-dtype", args.infer_expert_bias_dtype])
+    if args.infer_device_backend:
+        cmd.extend(["--infer-device-backend", args.infer_device_backend])
+    if args.infer_atten_tp_size is not None:
+        cmd.extend(["--infer-atten-tp-size", str(args.infer_atten_tp_size)])
     if args.vllm_tp_size is not None:
         cmd.extend(["--vllm-tp-size", str(args.vllm_tp_size)])
     if args.vllm_pp_size is not None:
@@ -680,6 +849,30 @@ def main() -> None:
         "--download-dir",
         default=None,
         help="Optional HF download cache dir",
+    )
+    parser.add_argument(
+        "--infer-router-dtype",
+        choices=["bf16", "fp16", "fp32"],
+        default=None,
+        help="Override infer_conf.router_dtype used by Megatron-side conversion.",
+    )
+    parser.add_argument(
+        "--infer-expert-bias-dtype",
+        choices=["bf16", "fp16", "fp32"],
+        default=None,
+        help="Override infer_conf.expert_bias_dtype used by Megatron-side conversion.",
+    )
+    parser.add_argument(
+        "--infer-device-backend",
+        choices=["cuda", "npu", "cpu"],
+        default=None,
+        help="Override infer_conf.device_backend used by Megatron-side conversion.",
+    )
+    parser.add_argument(
+        "--infer-atten-tp-size",
+        type=int,
+        default=None,
+        help="Override infer_conf.infer_atten_tp_size used by Megatron-side conversion.",
     )
     parser.add_argument(
         "--trust-remote-code",
