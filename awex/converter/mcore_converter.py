@@ -388,15 +388,13 @@ class McoreToHFWeightConverter:
         # NPU/vLLM-ascend layout adaptation is handled on inference side.
         self._transpose_moe_fc1_for_npu = False
         self._transpose_log_once = set()
-        self.router_dtype = infer_conf.get("router_dtype", "bf16")
-        if self.router_dtype == "bf16":
-            self.router_dtype = torch.bfloat16
-        elif self.router_dtype == "fp16":
-            self.router_dtype = torch.float16
-        elif self.router_dtype == "fp32":
-            self.router_dtype = torch.float32
-        else:
-            raise ValueError(f"Unsupported router dtype: {self.router_dtype}")
+        self.router_dtype = self._resolve_named_dtype(
+            infer_conf.get("router_dtype", "bf16"), field_name="router_dtype"
+        )
+        self.expert_bias_dtype = self._resolve_named_dtype(
+            infer_conf.get("expert_bias_dtype", "bf16"),
+            field_name="expert_bias_dtype",
+        )
         if "infer_atten_tp_size" not in infer_conf:
             raise ValueError("infer_atten_tp_size must be specified")
         self.infer_atten_tp_size = infer_conf["infer_atten_tp_size"]
@@ -423,6 +421,16 @@ class McoreToHFWeightConverter:
         if isinstance(config, dict):
             return config.get(key, default)
         return getattr(config, key, default)
+
+    @staticmethod
+    def _resolve_named_dtype(dtype_name: str, *, field_name: str) -> torch.dtype:
+        if dtype_name == "bf16":
+            return torch.bfloat16
+        if dtype_name == "fp16":
+            return torch.float16
+        if dtype_name == "fp32":
+            return torch.float32
+        raise ValueError(f"Unsupported {field_name}: {dtype_name}")
 
     def _resolve_infer_device_backend(self, infer_conf: Dict) -> str:
         conf_backend = infer_conf.get("device_backend")
@@ -666,7 +674,7 @@ class McoreToHFWeightConverter:
     ) -> Tuple[str, torch.Tensor]:
         """Convert bias parameters"""
         if "expert_bias" in name:
-            return ("mlp.gate.expert_bias", parameter.to(torch.bfloat16))
+            return ("mlp.gate.expert_bias", parameter.to(self.expert_bias_dtype))
         else:
             raise NotImplementedError(f"Unsupported bias parameter name: {name}")
 

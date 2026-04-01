@@ -93,6 +93,66 @@ def _build_param_meta():
     )
 
 
+def _build_gate_param_meta(dtype=torch.float32):
+    shard = ParameterShardMeta(
+        tp_rank=0,
+        attn_tp_rank=0,
+        pp_rank=0,
+        ep_rank=0,
+        ep_tp_rank=0,
+        global_rank=0,
+        world_size=1,
+        engine_rank=0,
+        name="model.layers.0.mlp.gate.weight",
+        shape=(4, 4),
+        numel=16,
+        dtype=dtype,
+        global_offset=(0, 0),
+        sharding_type=ShardingType.NO_SHARDING,
+        num_shards=1,
+        sharding_dim=0,
+    )
+    replica = ParameterReplicaMeta(shards=[shard])
+    return ParameterMeta(
+        name=shard.name,
+        global_numel=16,
+        global_shape=(4, 4),
+        dtype=dtype,
+        shards=[shard],
+        replicas=[replica],
+    )
+
+
+def _build_expert_bias_param_meta(dtype=torch.float32):
+    shard = ParameterShardMeta(
+        tp_rank=0,
+        attn_tp_rank=0,
+        pp_rank=0,
+        ep_rank=0,
+        ep_tp_rank=0,
+        global_rank=0,
+        world_size=1,
+        engine_rank=0,
+        name="model.layers.0.mlp.gate.expert_bias",
+        shape=(4,),
+        numel=4,
+        dtype=dtype,
+        global_offset=(0,),
+        sharding_type=ShardingType.NO_SHARDING,
+        num_shards=1,
+        sharding_dim=0,
+    )
+    replica = ParameterReplicaMeta(shards=[shard])
+    return ParameterMeta(
+        name=shard.name,
+        global_numel=4,
+        global_shape=(4,),
+        dtype=dtype,
+        shards=[shard],
+        replicas=[replica],
+    )
+
+
 def test_weights_reader_infer_conf_carries_engine_name(monkeypatch):
     params_meta = [_build_param_meta()]
     meta_server = _DummyMetaServerClient()
@@ -126,3 +186,43 @@ def test_weights_reader_infer_conf_carries_engine_name(monkeypatch):
     assert engine.received_task_kwargs is not None
     init_infer_conf = pickle.loads(engine.received_task_kwargs["infer_conf_bytes"])
     assert init_infer_conf["engine_name"] == "vllm"
+
+
+def test_weights_reader_prefers_runtime_router_dtype(monkeypatch):
+    params_meta = [
+        _build_gate_param_meta(dtype=torch.float32),
+        _build_expert_bias_param_meta(dtype=torch.float32),
+        _build_param_meta(),
+    ]
+    meta_server = _DummyMetaServerClient()
+    meta_server.objects["training_params_meta"] = params_meta
+
+    monkeypatch.setattr(
+        "awex.reader.weights_reader.MetaServerClient",
+        lambda *args, **kwargs: meta_server,
+    )
+    monkeypatch.setattr(
+        "awex.reader.weights_reader.check_train_infer_params_meta",
+        lambda *args, **kwargs: None,
+    )
+
+    infer_config = InferenceConfig(
+        meta_server_addr="127.0.0.1:12345",
+        tp_size=1,
+        pp_size=1,
+        dp_size=1,
+        num_engines=1,
+        engine_rank=0,
+        comm_backend="nccl",
+        enable_debug_mode=True,
+    )
+    engine = _DummyInferenceEngine(infer_config)
+    reader = WeightsReader(engine, meta_resolver=_DummyMetaResolver(params_meta))
+
+    reader._initialize()
+
+    assert meta_server.objects["infer_conf"]["router_dtype"] == "fp32"
+    assert meta_server.objects["infer_conf"]["expert_bias_dtype"] == "fp32"
+    init_infer_conf = pickle.loads(engine.received_task_kwargs["infer_conf_bytes"])
+    assert init_infer_conf["router_dtype"] == "fp32"
+    assert init_infer_conf["expert_bias_dtype"] == "fp32"
