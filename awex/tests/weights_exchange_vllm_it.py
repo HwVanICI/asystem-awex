@@ -70,6 +70,7 @@ class VLLMWeightsExchangeIT:
         inference_config=None,
         comm_backend=None,
         use_mbridge=False,
+        trust_remote_code=False,
         host="127.0.0.1",
         port=8000,
         validate=False,
@@ -91,6 +92,7 @@ class VLLMWeightsExchangeIT:
         self.host = host
         self.port = port
         self.use_mbridge = use_mbridge
+        self.trust_remote_code = trust_remote_code
         self.validate = validate
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
@@ -170,6 +172,8 @@ class VLLMWeightsExchangeIT:
             "--disable-log-requests",
             "--enforce-eager",
         ]
+        if self.trust_remote_code:
+            cmd.append("--trust-remote-code")
         logger.info("Starting vLLM server: %s", " ".join(cmd))
         logger.info("vLLM subprocess %s=%s", visible_env, env.get(visible_env, ""))
 
@@ -353,6 +357,7 @@ def main(args):
         inference_config=inference_config,
         comm_backend=comm_backend,
         use_mbridge=args.use_mbridge,
+        trust_remote_code=args.trust_remote_code,
         host=args.host,
         port=args.port,
         validate=args.validate,
@@ -413,6 +418,11 @@ if __name__ == "__main__":
         "--use-mbridge",
         action="store_true",
         help="Load HF weights into Megatron via mbridge (skip DCP conversion).",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass --trust-remote-code to the vLLM server for custom HF model code.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
