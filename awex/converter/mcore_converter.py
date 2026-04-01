@@ -401,6 +401,21 @@ class McoreToHFWeightConverter:
             raise ValueError("infer_atten_tp_size must be specified")
         self.infer_atten_tp_size = infer_conf["infer_atten_tp_size"]
 
+    def _resolve_total_num_experts(self) -> int:
+        value = (
+            getattr(self.hf_config, "num_experts", None)
+            or getattr(self.hf_config, "num_local_experts", None)
+            or getattr(self.hf_config, "n_routed_experts", None)
+            or getattr(self.tf_config, "num_experts", None)
+            or getattr(self.tf_config, "num_local_experts", None)
+        )
+        if value is None:
+            raise AttributeError(
+                "Cannot resolve total number of experts from hf_config/tf_config. "
+                "Expected one of num_experts, num_local_experts, or n_routed_experts."
+            )
+        return int(value)
+
     @staticmethod
     def _read_cfg_value(config, key: str, default=None):
         if config is None:
@@ -624,7 +639,7 @@ class McoreToHFWeightConverter:
             else:
                 # mlp.experts.linear_fc1.weight0
                 local_expert_id = int(name.rsplit("weight", 1)[-1])
-            num_experts = self.hf_config.num_experts
+            num_experts = self._resolve_total_num_experts()
             num_experts_per_partition = num_experts // self.rank_info.ep_size
             expert_id = (
                 local_expert_id + self.rank_info.ep_rank * num_experts_per_partition
