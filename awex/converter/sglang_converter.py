@@ -69,6 +69,19 @@ class SGlangToHFWeightConverter:
             return "npu"
         return "cuda"
 
+    def _resolve_num_router_experts(self) -> int:
+        value = (
+            getattr(self.model_config, "num_experts", None)
+            or getattr(self.model_config, "num_local_experts", None)
+            or getattr(self.model_config, "n_routed_experts", None)
+        )
+        if value is None:
+            raise AttributeError(
+                "Cannot resolve number of routed experts from model config. "
+                "Expected one of num_experts, num_local_experts, or n_routed_experts."
+            )
+        return int(value)
+
     def _use_transposed_moe_layout(self, name: str, parameter: torch.Tensor) -> bool:
         if self.device_backend != "npu" or parameter.ndim != 2:
             return False
@@ -203,10 +216,7 @@ class SGlangToHFWeightConverter:
         """
         converted_params = []
         # Get number of router experts from config
-        num_router_experts = (
-            getattr(self.model_config, "num_experts", None)
-            or self.model_config.n_routed_experts
-        )
+        num_router_experts = self._resolve_num_router_experts()
         if "expert_bias" in name:
             return [(name, parameter)]
         if "shared_experts" in name:
@@ -352,9 +362,15 @@ class SGlangToHFWeightConverter:
                 ]
             elif "mlp" in remaining_name:
                 if "gate.weight" in remaining_name:
-                    return [(name, parameter)]
+                    return [(f"model.layers.{layer_idx}.mlp.gate.weight", parameter)]
                 elif "router.weight" in remaining_name:
                     return [(f"model.layers.{layer_idx}.mlp.gate.weight", parameter)]
+                elif "gate.expert_bias" in remaining_name or "router.expert_bias" in remaining_name:
+                    return [
+                        (f"model.layers.{layer_idx}.mlp.gate.expert_bias", parameter)
+                    ]
+                elif "e_score_correction_bias" in remaining_name:
+                    return [(f"model.layers.{layer_idx}.mlp.gate.expert_bias", parameter)]
 
                 # Check if this is an expert parameter
                 if ".expert" in remaining_name or "experts." in remaining_name:
