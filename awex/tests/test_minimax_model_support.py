@@ -149,7 +149,7 @@ def test_minimax_train_converter_uses_num_local_experts_fallback():
 def test_minimax_train_converter_normalizes_router_expert_bias_name():
     cfg = _MiniMaxConfig()
     rank_info = _make_rank_info(tp_size=1, ep_size=1)
-    infer_conf = {"infer_atten_tp_size": 1}
+    infer_conf = {"infer_atten_tp_size": 1, "expert_bias_dtype": "fp32"}
     tf_config = SimpleNamespace(num_local_experts=256)
 
     converter = get_train_weights_converter(
@@ -169,6 +169,7 @@ def test_minimax_train_converter_normalizes_router_expert_bias_name():
     assert [name for name, _ in converted] == [
         "model.layers.0.mlp.gate.expert_bias"
     ]
+    assert converted[0][1].dtype == torch.float32
 
 
 def test_minimax_query_layernorm_uses_tp_sharding():
