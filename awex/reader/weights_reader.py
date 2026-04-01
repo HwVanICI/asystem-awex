@@ -49,6 +49,22 @@ from awex.util.tensor_util import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_runtime_dtype(dtype: torch.dtype | str | None) -> str | None:
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        dtype = str(dtype).removeprefix("torch.")
+    mapping = {
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "float32": "fp32",
+        "bf16": "bf16",
+        "fp16": "fp16",
+        "fp32": "fp32",
+    }
+    return mapping.get(dtype)
+
+
 def derive_expected_pp_ranks(
     infer_params_meta: Sequence[ParameterMeta],
     local_engine_rank: int,
@@ -180,6 +196,18 @@ class WeightsReader(WeightExchangeReader):
         self.expected_pp_ranks = derive_expected_pp_ranks(
             self.parameters_meta, self.engine_rank
         )
+        runtime_router_dtype = self._resolve_runtime_param_dtype(
+            ("mlp.gate.weight", "mlp.router.weight"),
+            hf_config_attr="router_dtype",
+            default="bf16",
+            log_label="router_dtype",
+        )
+        runtime_expert_bias_dtype = self._resolve_runtime_param_dtype(
+            ("mlp.gate.expert_bias",),
+            hf_config_attr=None,
+            default=runtime_router_dtype,
+            log_label="expert_bias_dtype",
+        )
         logger.info(
             "Derived expected_pp_ranks for engine %s: %s",
             self.engine_rank,
@@ -188,7 +216,8 @@ class WeightsReader(WeightExchangeReader):
         self.infer_conf = {
             "engine_name": self.inference_engine.engine_name,
             "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
-            "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
+            "router_dtype": runtime_router_dtype,
+            "expert_bias_dtype": runtime_expert_bias_dtype,
             "infer_engine_config": self.infer_engine_config,
             "hf_config": simple_hf_config(self.hf_config),
             "infer_world_size": self.infer_world_size,
@@ -241,6 +270,43 @@ class WeightsReader(WeightExchangeReader):
         logger.info(
             f"Finished full initialization of weights reader for engine rank {self.engine_rank}"
         )
+
+    def _resolve_runtime_param_dtype(
+        self,
+        candidate_names: tuple[str, ...],
+        *,
+        hf_config_attr: str | None,
+        default: str,
+        log_label: str,
+    ) -> str:
+        for param_meta in self.parameters_meta:
+            name = param_meta.name
+            if not any(candidate in name for candidate in candidate_names):
+                continue
+            resolved = _normalize_runtime_dtype(getattr(param_meta, "dtype", None))
+            if resolved is not None:
+                logger.info(
+                    "Resolved runtime %s from infer params meta: %s (%s)",
+                    log_label,
+                    resolved,
+                    name,
+                )
+                return resolved
+        fallback_value = (
+            getattr(self.hf_config, hf_config_attr, default)
+            if hf_config_attr is not None
+            else default
+        )
+        fallback = _normalize_runtime_dtype(fallback_value)
+        if fallback is None:
+            fallback = default
+        logger.info(
+            "Falling back to %s=%s; no runtime match found in infer params meta for %s.",
+            log_label,
+            fallback,
+            candidate_names,
+        )
+        return fallback
 
     @staticmethod
     def _init_in_tp_worker(
