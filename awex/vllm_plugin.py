@@ -20,17 +20,22 @@ import logging
 import os
 from typing import Any
 
-from fastapi import Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from vllm.entrypoints.openai.api_server import router
-from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+
+from vllm.entrypoints.openai.api_server import build_app as _original_build_app
+from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+
 
 from awex.config import InferenceConfig
 from awex.vllm_awex_adapter import AwexVLLMServerAdapter
 
+router = APIRouter()
+
 logger = logging.getLogger(__name__)
 
 _awex_plugin_registered = False
+_awex_build_app_patched = False
 _AWEX_WORKER_METHODS = {
     "_get_model_param_info": (
         "awex.meta.infer_meta_resolver",
@@ -394,12 +399,33 @@ def flush_cache(self):
         return flush_fn()
     return True
 
+def _awex_build_app(args, supported_tasks=None):
+    """Wrap vLLM build_app so AWEX routes are mounted on the live FastAPI app."""
+    app = _original_build_app(args, supported_tasks=supported_tasks)
+    app.include_router(router)
+    return app
+
+
+def _patch_vllm_build_app() -> None:
+    """Patch vLLM so it uses AWEX-wrapped build_app."""
+    global _awex_build_app_patched
+    if _awex_build_app_patched:
+        return
+
+    import vllm.entrypoints.openai.api_server as _api_server_module
+
+    _api_server_module.build_app = _awex_build_app
+    _awex_build_app_patched = True
+
 
 def register_awex_plugin() -> None:
     """Register Awex endpoints and worker patches for vLLM."""
     global _awex_plugin_registered
+
     if _awex_plugin_registered:
+        _patch_vllm_build_app()  
         return
+
     _awex_plugin_registered = True
 
     _patch_awex_worker()
@@ -436,6 +462,7 @@ def register_awex_plugin() -> None:
             logger.exception("Awex init failed")
             return _to_json_error(f"Awex init failed: {exc}")
 
+
     @router.post("/areal_awex_update")
     async def awex_update(request: AwexUpdateRequest, raw_request: Request):
         try:
@@ -447,6 +474,8 @@ def register_awex_plugin() -> None:
         except Exception as exc:
             logger.exception("Awex update failed")
             return _to_json_error(f"Awex update failed: {exc}")
+
+    _patch_vllm_build_app()
 
 
 def register_awex_routes() -> None:
