@@ -33,6 +33,82 @@ from awex.sharding.rank_info import RankInfo
 from awex.util.common import to_dict
 
 
+_AWEX_MODEL_SEARCH_ATTRS = (
+    "model",
+    "module",
+    "_model",
+    "_module",
+    "graph_runner",
+    "_graph_runner",
+    "decode_model",
+    "_decode_model",
+    "compiled_model",
+    "_compiled_model",
+    "graph_module",
+    "_graph_module",
+    "model_module",
+    "_model_module",
+    "runner",
+    "_runner",
+    "worker",
+    "_worker",
+)
+
+
+def _named_parameter_names(module) -> List[str] | None:
+    if module is None or not hasattr(module, "named_parameters"):
+        return None
+    try:
+        return [name for name, _ in module.named_parameters()]
+    except Exception:
+        return None
+
+
+def _iter_model_candidates(root):
+    queue = [((), root)]
+    seen_ids = {id(root)}
+    while queue:
+        path, candidate = queue.pop(0)
+        yield path, candidate
+        for attr in _AWEX_MODEL_SEARCH_ATTRS:
+            child = getattr(candidate, attr, None)
+            if child is None or child is candidate:
+                continue
+            child_id = id(child)
+            if child_id in seen_ids:
+                continue
+            seen_ids.add(child_id)
+            queue.append((path + (attr,), child))
+
+
+def _resolve_underlying_model(root):
+    best_model = root
+    best_path = ()
+    best_score = (-1, -1, -1)
+    for path, candidate in _iter_model_candidates(root):
+        names = _named_parameter_names(candidate)
+        if not names:
+            continue
+        score = (
+            int(any(".experts." in name or ".shared_experts." in name for name in names)),
+            int(any(".layers." in name for name in names)),
+            len(names),
+        )
+        if score > best_score:
+            best_model = candidate
+            best_path = path
+            best_score = score
+    return best_model, best_path, best_score
+
+
+def _resolve_model_arch_name(model) -> str:
+    config = getattr(model, "config", None)
+    architectures = getattr(config, "architectures", None)
+    if isinstance(architectures, list) and architectures:
+        return architectures[0]
+    return type(model).__name__
+
+
 class InferParamMetaResolver(ParamMetaResolver):
     def __init__(
         self,
@@ -197,11 +273,20 @@ class InferParamMetaResolver(ParamMetaResolver):
         Returns:
             dict: Metadata for the current rank, including rank_info, params_meta, and model_arch_name.
         """
-        model = kwargs["model"]
+        root_model = kwargs["model"]
         model_context = kwargs["model_context"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
-        model_arch_name = type(model).__name__
+        model, unwrap_path, unwrap_score = _resolve_underlying_model(root_model)
+        if model is not root_model:
+            logger.info(
+                "Infer meta: unwrapped model via %s (score=%s): %s -> %s",
+                ".".join(unwrap_path),
+                unwrap_score,
+                type(root_model).__name__,
+                type(model).__name__,
+            )
+        model_arch_name = _resolve_model_arch_name(model)
         meta = {
             "rank_info": rank_info,
             "params_meta": params_meta,

@@ -46,6 +46,26 @@ except ImportError:
 _awex_build_app_patched = False
 
 _awex_plugin_registered = False
+_AWEX_MODEL_SEARCH_ATTRS = (
+    "model",
+    "module",
+    "_model",
+    "_module",
+    "graph_runner",
+    "_graph_runner",
+    "decode_model",
+    "_decode_model",
+    "compiled_model",
+    "_compiled_model",
+    "graph_module",
+    "_graph_module",
+    "model_module",
+    "_model_module",
+    "runner",
+    "_runner",
+    "worker",
+    "_worker",
+)
 _AWEX_WORKER_METHODS = {
     "_get_model_param_info": (
         "awex.meta.infer_meta_resolver",
@@ -169,6 +189,52 @@ def _get_awex_adapter(raw_request):
     if adapter is None:
         raise RuntimeError("Awex adapter not initialized. Call /areal_awex_init first.")
     return adapter
+
+
+def _named_parameter_names(module) -> list[str] | None:
+    if module is None or not hasattr(module, "named_parameters"):
+        return None
+    try:
+        return [name for name, _ in module.named_parameters()]
+    except Exception:
+        return None
+
+
+def _iter_awex_model_candidates(root):
+    queue = [((), root)]
+    seen_ids = {id(root)}
+    while queue:
+        path, candidate = queue.pop(0)
+        yield path, candidate
+        for attr in _AWEX_MODEL_SEARCH_ATTRS:
+            child = getattr(candidate, attr, None)
+            if child is None or child is candidate:
+                continue
+            child_id = id(child)
+            if child_id in seen_ids:
+                continue
+            seen_ids.add(child_id)
+            queue.append((path + (attr,), child))
+
+
+def _resolve_awex_model(root):
+    best_model = root
+    best_path = ()
+    best_score = (-1, -1, -1)
+    for path, candidate in _iter_awex_model_candidates(root):
+        names = _named_parameter_names(candidate)
+        if not names:
+            continue
+        score = (
+            int(any(".experts." in name or ".shared_experts." in name for name in names)),
+            int(any(".layers." in name for name in names)),
+            len(names),
+        )
+        if score > best_score:
+            best_model = candidate
+            best_path = path
+            best_score = score
+    return best_model, best_path, best_score
 
 
 def _patch_awex_worker() -> None:
@@ -337,6 +403,28 @@ def _patch_awex_worker() -> None:
     def awex_get_model_context(self):
         return _awex_rank_info(self, None)
 
+    def awex_get_model(self):
+        cached = getattr(self, "_awex_cached_model", None)
+        if cached is not None:
+            return cached
+        root_model = self.model_runner.model
+        resolved_model, path, score = _resolve_awex_model(root_model)
+        self._awex_cached_model = resolved_model
+        if resolved_model is not root_model:
+            logger.info(
+                "Awex resolved underlying vLLM model via %s (score=%s) instead of root %s.",
+                ".".join(path),
+                score,
+                type(root_model).__name__,
+            )
+        else:
+            logger.info(
+                "Awex using root vLLM model %s for parameter introspection (score=%s).",
+                type(root_model).__name__,
+                score,
+            )
+        return resolved_model
+
     def awex_execute(
         self, task_module: str, task_qualname: str, task_kwargs: dict | None = None
     ):
@@ -349,11 +437,12 @@ def _patch_awex_worker() -> None:
         if isinstance(infer_engine_config, dict):
             infer_engine_config = InferenceConfig.from_dict(infer_engine_config)
             task_kwargs["infer_engine_config"] = infer_engine_config
-        task_kwargs["model"] = self.model_runner.model
+        task_kwargs["model"] = awex_get_model(self)
         task_kwargs["model_context"] = _awex_model_context(self, infer_engine_config)
         result = target(**task_kwargs)
         return _sanitize_for_ipc(result)
 
+    WorkerBase.awex_get_model = awex_get_model
     WorkerBase.awex_get_model_context = awex_get_model_context
     WorkerBase.awex_execute = awex_execute
     WorkerBase.awex_update_weights_from_disk = awex_update_weights_from_disk
@@ -398,7 +487,7 @@ def awex_update_weights_from_disk(
     self.model_runner.model_config.model = model_path
     model_loader = get_model_loader(self.model_runner.vllm_config.load_config)
     model_loader.load_weights(
-        self.model_runner.model, model_config=self.model_runner.model_config
+        self.awex_get_model(), model_config=self.model_runner.model_config
     )
     return True
 
