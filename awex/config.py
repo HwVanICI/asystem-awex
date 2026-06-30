@@ -57,6 +57,9 @@ class InferenceConfig:
 
     local_rank: Optional[int] = None
     # awex specific config
+    # source training engine name; used when inference metadata must match
+    # engine-specific canonical parameter names.
+    train_engine_name: Optional[str] = None
     # the number of all sglang engines in the cluster
     num_engines: int = 1
     # the rank of the current engine

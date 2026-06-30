@@ -265,12 +265,15 @@ class WeightsReader(WeightExchangeReader):
         infer_conf = pickle.loads(infer_conf_bytes)
         parameters_meta = pickle.loads(parameters_meta_bytes)
         training_params_meta = pickle.loads(training_params_meta_bytes)
-        infer_engine_config = model_context.get("infer_engine_config")
+        infer_engine_config = infer_conf.get(
+            "infer_engine_config"
+        ) or model_context.get("infer_engine_config")
         if infer_engine_config is not None:
             if isinstance(infer_engine_config, dict):
                 infer_engine_config["comm_backend"] = weights_comm_backend
             else:
                 infer_engine_config.comm_backend = weights_comm_backend
+            model_context["infer_engine_config"] = infer_engine_config
         if weights_comm_backend in ("nccl", "hccl"):
             from awex.reader.nccl_reader import NCCLWorkerWeightsReader
 
@@ -643,8 +646,17 @@ class WorkerWeightsReader:
         self.hf_config = infer_conf["hf_config"]
         self.model_arch_name = self.hf_config.architectures[0]
         self.scheduler = model_context["scheduler"]
-        self.infer_engine_config = model_context["infer_engine_config"]
-        self.comm_backend = getattr(self.infer_engine_config, "comm_backend", "nccl")
+        self.infer_engine_config = (
+            infer_conf.get("infer_engine_config")
+            or model_context["infer_engine_config"]
+        )
+        model_context["infer_engine_config"] = self.infer_engine_config
+        if isinstance(self.infer_engine_config, dict):
+            self.comm_backend = self.infer_engine_config.get("comm_backend", "nccl")
+        else:
+            self.comm_backend = getattr(
+                self.infer_engine_config, "comm_backend", "nccl"
+            )
         self.engine_rank = engine_rank
         self.num_engines = num_engines
         self.enable_debug_mode = enable_debug_mode

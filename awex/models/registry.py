@@ -144,6 +144,10 @@ def get_train_weights_converter(
         if tf_config is None:
             raise ValueError("tf_config is required for McoreToHFWeightConverter")
         return converter(hf_config, rank_info, infer_conf, tf_config=tf_config)
+    if engine_name == "fsdp":
+        from awex.converter.fsdp_converter import FSDPToHFWeightConverter
+
+        return FSDPToHFWeightConverter(hf_config, rank_info, infer_conf)
     else:
         raise NotImplementedError(f"Engine {engine_name} not implemented.")
 

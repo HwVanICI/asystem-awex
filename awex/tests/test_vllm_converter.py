@@ -23,11 +23,19 @@ from awex.converter.vllm_converter import VLLMToHFWeightConverter
 from awex.sharding.rank_info import RankInfo
 
 
-def _make_converter():
+def _make_converter(
+    train_engine_name=None,
+    num_attention_heads=8,
+    num_key_value_heads=8,
+    hidden_size=32,
+):
     hf_config = PretrainedConfig()
-    hf_config.num_attention_heads = 8
-    hf_config.num_key_value_heads = 8
+    hf_config.num_attention_heads = num_attention_heads
+    hf_config.num_key_value_heads = num_key_value_heads
+    hf_config.hidden_size = hidden_size
     infer_config = InferenceConfig(tp_size=1, ep_size=1)
+    if train_engine_name is not None:
+        infer_config.train_engine_name = train_engine_name
     rank_info = RankInfo(
         tp_rank=0,
         tp_size=1,
@@ -85,3 +93,37 @@ def test_glm4v_proj_mapping():
     name = "model.layers.0.self_attn.proj.weight"
     converted = converter.convert_param(name, weight)
     assert converted == [("model.layers.0.attention.dense.weight", weight)]
+
+
+def test_fsdp_mapping_splits_gqa_qkv_to_hf_names():
+    converter = _make_converter(train_engine_name="fsdp", num_key_value_heads=4)
+    weight = torch.arange(64 * 32, dtype=torch.float32).reshape(64, 32)
+
+    converted = converter.convert_param(
+        "model.layers.0.self_attn.qkv_proj.weight", weight
+    )
+
+    assert [name for name, _ in converted] == [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    ]
+    assert converted[0][1].shape == (32, 32)
+    assert converted[1][1].shape == (16, 32)
+    assert converted[2][1].shape == (16, 32)
+
+
+def test_fsdp_mapping_keeps_hf_attention_and_norm_names():
+    converter = _make_converter(train_engine_name="fsdp")
+    weight = torch.zeros((12, 12))
+    norm = torch.zeros((12,))
+
+    assert converter.convert_param(
+        "model.layers.0.self_attn.o_proj.weight", weight
+    ) == [("model.layers.0.self_attn.o_proj.weight", weight)]
+    assert converter.convert_param("model.layers.0.self_attn.q_norm.weight", norm) == [
+        ("model.layers.0.self_attn.q_norm.weight", norm)
+    ]
+    assert converter.convert_param("model.layers.0.self_attn.k_norm.weight", norm) == [
+        ("model.layers.0.self_attn.k_norm.weight", norm)
+    ]

@@ -116,6 +116,7 @@ class AwexInitRequest(OpenAIBaseModel):
     engine_rank: int = 0
     num_engines: int = 1
     comm_backend: str = "file"
+    train_engine_name: str | None = None
     enable_debug_mode: bool = False
     debug_mode_config: dict[str, Any] | None = None
     disable_weights_exchange_pipeline: bool = False
@@ -467,6 +468,7 @@ def register_awex_plugin() -> None:
                 engine_rank=request.engine_rank,
                 num_engines=request.num_engines,
                 comm_backend=request.comm_backend,
+                train_engine_name=request.train_engine_name,
                 enable_debug_mode=request.enable_debug_mode,
                 debug_mode_config=request.debug_mode_config,
                 disable_weights_exchange_pipeline=request.disable_weights_exchange_pipeline,

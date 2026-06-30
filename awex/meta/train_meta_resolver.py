@@ -26,6 +26,8 @@ from transformers import PretrainedConfig
 from awex.meta.meta_resolver import ParamMetaResolver, logger
 from awex.meta.weight_meta import (
     ParameterMeta,
+    ParameterReplicaMeta,
+    ParameterShardMeta,
     compute_total_model_size,
     dump_parameters_meta,
 )
@@ -197,6 +199,168 @@ class McoreParamMetaResolver(ParamMetaResolver):
         return self._sharding_strategy.get_sharding_strategy(
             name, rank_info=rank_info, param_meta=param_meta
         )
+
+
+class FSDPParamMetaResolver(ParamMetaResolver):
+    def __init__(
+        self,
+        train_engine,
+        hf_config: PretrainedConfig,
+        infer_conf: Dict,
+    ):
+        super().__init__(hf_config)
+        del infer_conf
+        self._train_engine = train_engine
+        self._model_arch_name = self.hf_config.architectures[0]
+        self._rank_info = train_engine.get_awex_rank_info()
+        self._params_raw_meta = self._collect_model_param_raw_info()
+        self._params_meta = self._build_fsdp_params_meta()
+        self.total_numel = sum(param.global_numel for param in self._params_meta)
+        self.total_size = compute_total_model_size(self._params_meta)
+        logger.info(
+            f"Total number of elements in the FSDP model: {self.total_numel}, "
+            f"total size: {self.total_size} bytes"
+        )
+
+    def get_model_arch_name(self) -> str:
+        return self._model_arch_name
+
+    def get_parameters_meta(self) -> List[ParameterMeta]:
+        return self._params_meta
+
+    def _get_params_raw_meta(self) -> List[Dict[str, Any]]:
+        return self._params_raw_meta
+
+    def _collect_model_param_raw_info(self) -> List[Dict[str, Any]]:
+        params_meta = []
+        for param_meta in self._train_engine.get_awex_local_param_metadata():
+            param_meta = dict(param_meta)
+            param_meta.pop("rank_info", None)
+            params_meta.append(param_meta)
+
+        meta = {
+            "rank_info": self._rank_info,
+            "params_meta": params_meta,
+            "model_arch_name": self._model_arch_name,
+        }
+        global_metadata: List[Dict[str, Any]] = [None] * dist.get_world_size()  # type: ignore
+        logger.info(
+            f"Starting FSDP all_gather_object of {dist.get_world_size()}, "
+            f"current rank {dist.get_rank()}"
+        )
+        dist.all_gather_object(global_metadata, meta)
+        return global_metadata
+
+    def _build_fsdp_params_meta(self) -> List[ParameterMeta]:
+        params: Dict[str, Dict[str, Any]] = {}
+
+        for rank_meta in self._params_raw_meta:
+            rank_info: RankInfo = rank_meta["rank_info"]
+            for param_meta in rank_meta["params_meta"]:
+                name = param_meta["name"]
+                dtype = param_meta["dtype"]
+                if isinstance(dtype, str):
+                    try:
+                        import torch
+
+                        dtype = getattr(torch, dtype)
+                    except Exception:
+                        pass
+
+                num_shards = int(param_meta.get("num_shards", 1))
+                sharding_dim = int(param_meta.get("sharding_dim", 0))
+                sharding_type = (
+                    ShardingType.TP_SHARDING
+                    if num_shards > 1
+                    else ShardingType.NO_SHARDING
+                )
+                shard = ParameterShardMeta(
+                    name=name,
+                    tp_rank=rank_info.tp_rank,
+                    attn_tp_rank=rank_info.attn_tp_rank,
+                    pp_rank=rank_info.pp_rank,
+                    ep_rank=rank_info.ep_rank,
+                    ep_tp_rank=rank_info.ep_tp_rank,
+                    global_rank=rank_info.global_rank,
+                    engine_rank=rank_info.engine_rank,
+                    world_size=rank_info.world_size,
+                    shape=tuple(param_meta["shape"]),
+                    numel=int(param_meta["numel"]),
+                    dtype=dtype,
+                    global_offset=tuple(param_meta["global_offset"]),
+                    sharding_type=sharding_type,
+                    num_shards=num_shards,
+                    sharding_dim=sharding_dim,
+                    cp_rank=rank_info.cp_rank,
+                    cp_size=rank_info.cp_size,
+                    cp_mode=rank_info.cp_mode,
+                )
+                entry = params.setdefault(
+                    name,
+                    {
+                        "global_numel": int(param_meta["global_numel"]),
+                        "global_shape": tuple(param_meta["global_shape"]),
+                        "dtype": dtype,
+                        "shards": [],
+                    },
+                )
+                entry["shards"].append(shard)
+
+        params_meta = []
+        for name, entry in params.items():
+            shards = sorted(
+                entry["shards"],
+                key=lambda shard: (shard.global_offset, shard.global_rank),
+            )
+            offset_to_shards: Dict[Tuple[int, ...], List[ParameterShardMeta]] = {}
+            for shard in shards:
+                offset_to_shards.setdefault(shard.global_offset, []).append(shard)
+
+            for offset_shards in offset_to_shards.values():
+                offset_shards.sort(key=lambda shard: shard.global_rank)
+
+            replica_count = min(
+                len(offset_shards) for offset_shards in offset_to_shards.values()
+            )
+            if replica_count <= 0:
+                raise ValueError(f"No FSDP replicas found for parameter {name}")
+
+            offsets = sorted(offset_to_shards.keys())
+            replicas = []
+            for replica_idx in range(replica_count):
+                replica = [offset_to_shards[offset][replica_idx] for offset in offsets]
+                replica.sort(key=lambda shard: shard.global_offset)
+                replicas.append(ParameterReplicaMeta(shards=replica))
+
+            params_meta.append(
+                ParameterMeta(
+                    name=name,
+                    global_numel=entry["global_numel"],
+                    global_shape=entry["global_shape"],
+                    dtype=entry["dtype"],
+                    shards=shards,
+                    replicas=replicas,
+                )
+            )
+
+        logger.info(
+            "Number of FSDP shards: "
+            f"{sum(len(replica.shards) for param in params_meta for replica in param.replicas)}"
+        )
+        return params_meta
+
+    def _get_sharding_info(
+        self, name: str, rank_info: RankInfo, param_meta: Dict[str, Any]
+    ) -> Tuple[ShardingType, int, int]:
+        del name, rank_info
+        num_shards = int(param_meta.get("num_shards", 1))
+        sharding_type = (
+            ShardingType.TP_SHARDING if num_shards > 1 else ShardingType.NO_SHARDING
+        )
+        return sharding_type, int(param_meta.get("sharding_dim", 0)), num_shards
+
+    def get_pp_stage_layer_id_map(self) -> Dict[Tuple[int, int], Dict[int, int]]:
+        return {}
 
 
 def _maybe_get_tf_config(models):
