@@ -217,7 +217,13 @@ class InferParamMetaResolver(ParamMetaResolver):
             rank_info=rank_info,
         )
         params = []
-        for name, param in model.named_parameters():
+        # Use the same tensors as the reader, including vLLM runtime weights.
+        parameter_iterator = (
+            sglang_to_hf_weight_converter.iter_model_parameters(model)
+            if convert_params
+            else model.named_parameters()
+        )
+        for name, param in parameter_iterator:
             if convert_params:
                 for hf_name, hf_param in sglang_to_hf_weight_converter.convert_param(
                     name, param

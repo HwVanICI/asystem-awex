@@ -27,6 +27,15 @@ from awex.converter.weights_converter import append_scale_inv, normalize_scale_i
 # all sglang related imports must be local imports to avoid import error if
 # users use other engine.
 class SGlangToHFWeightConverter:
+    # vLLM also inherits this base; defaults preserve ordinary parameter updates.
+    def iter_model_parameters(self, model):
+        """Yield exchange tensors; model converters may include runtime weights."""
+        return model.named_parameters()
+
+    def post_update_weights(self):
+        """Refresh model-specific derived weights after all tensors are copied."""
+        pass
+
     def __init__(
         self,
         model_config: PretrainedConfig,
