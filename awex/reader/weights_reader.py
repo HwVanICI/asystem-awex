@@ -736,9 +736,10 @@ class WorkerWeightsReader:
         )
 
     def initialize(self):
+        # Model adapters can expose writable views into vLLM runtime weights.
         self.parameters = {
             hf_name: hf_param
-            for name, param in self.model.named_parameters()
+            for name, param in self.weight_converter.iter_model_parameters(self.model)
             for hf_name, hf_param in self.weight_converter.convert_param(name, param)
         }
 
@@ -767,6 +768,8 @@ class WorkerWeightsReader:
             self._update_weights_in_colocate_mode(step_id, **kwargs)
         else:
             self._update_weights(step_id, **kwargs)
+        # Refresh derived inference weights after their source tensors arrive.
+        self.weight_converter.post_update_weights()
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
         )
