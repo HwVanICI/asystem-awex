@@ -163,11 +163,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         )
 
     def _set_device(self):
-        gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
-            self.scheduler, "local_rank", None
-        )
-        if gpu_id is None:
-            gpu_id = int(os.environ.get("LOCAL_RANK", 0))
+        gpu_id = device_util.current_device()
         device_type = device_util.get_device_type()
         device_count = device_util.device_count() or 1
         if device_type == "cuda":
@@ -229,29 +225,13 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             torch.npu.empty_cache()
 
     def _init_reader_in_colocate_mode(self):
-        device_phy_ids = [str(i) for i in range(8)]
-        visible_env_key = "CUDA_VISIBLE_DEVICES"
-        if device_util.get_device_type() == "npu":
-            device_phy_ids = [str(i) for i in range(16)]
-            visible_env_key = "ASCEND_RT_VISIBLE_DEVICES"
-
-        def _get_current_phy_id():
-            device_phy_id = os.getenv(visible_env_key)
-            if device_phy_id in device_phy_ids:
-                return device_phy_id
-            ids = device_phy_id.split(",")
-            gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
-                self.scheduler, "local_rank", None
-            )
-            if gpu_id is None:
-                gpu_id = int(os.environ.get("LOCAL_RANK", 0))
-            current_phy_id = ids[int(gpu_id)]
-            logger.info(
-                f"_get_current_phy_id:{current_phy_id=} {gpu_id=} {ids=} {os.environ.get('LOCAL_RANK', 0)=}"
-            )
-            return current_phy_id
-
-        device_id = _get_current_phy_id()
+        device_id = device_util.current_physical_device_id()
+        logger.info(
+            "Resolved inference physical device: current=%s visible=%s physical=%s",
+            device_util.current_device(),
+            device_util.visible_devices_env_value() or "(unset)",
+            device_id,
+        )
 
         self.meta_server_client.add_object_to_set(
             "inference_device_rank_entries",

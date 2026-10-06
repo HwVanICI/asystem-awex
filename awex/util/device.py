@@ -166,6 +166,30 @@ def visible_devices_env_value() -> str:
     return ""
 
 
+def current_physical_device_id() -> str:
+    """Return the current device's identifier in the host-visible namespace."""
+    logical_id = current_device()
+    visible_devices = [
+        device.strip()
+        for device in visible_devices_env_value().split(",")
+        if device.strip()
+    ]
+    if not visible_devices:
+        return str(logical_id)
+    if 0 <= logical_id < len(visible_devices):
+        return visible_devices[logical_id]
+
+    # Some accelerator runtimes report the physical identifier even when a
+    # visibility list is present. Preserve it when it is explicitly visible.
+    physical_id = str(logical_id)
+    if physical_id in visible_devices:
+        return physical_id
+    raise RuntimeError(
+        f"Current device {logical_id} cannot be resolved from visible devices "
+        f"{visible_devices}."
+    )
+
+
 def get_stream_class() -> type | None:
     device_type = get_device_type()
     if device_type == "npu":

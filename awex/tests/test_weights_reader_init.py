@@ -9,8 +9,10 @@ from awex.meta.weight_meta import (
     ParameterReplicaMeta,
     ParameterShardMeta,
 )
+from awex.reader.nccl_reader import NCCLWorkerWeightsReader
 from awex.reader.weights_reader import WeightsReader
 from awex.sharding.param_sharding import ShardingType
+from awex.util import device as device_util
 
 
 class _DummyHFConfig:
@@ -126,3 +128,25 @@ def test_weights_reader_infer_conf_carries_engine_name(monkeypatch):
     assert engine.received_task_kwargs is not None
     init_infer_conf = pickle.loads(engine.received_task_kwargs["infer_conf_bytes"])
     assert init_infer_conf["engine_name"] == "vllm"
+
+
+def test_nccl_reader_preserves_vllm_worker_device(monkeypatch):
+    reader = NCCLWorkerWeightsReader.__new__(NCCLWorkerWeightsReader)
+    reader.scheduler = SimpleNamespace(gpu_id=0, local_rank=0)
+    reader.transfer_rank = 8
+    reader.comm_backend = "hccl"
+    selected_devices = []
+
+    monkeypatch.setattr(device_util, "get_device_type", lambda: "npu")
+    monkeypatch.setattr(device_util, "current_device", lambda: 8)
+    monkeypatch.setattr(device_util, "device_count", lambda: 16)
+    monkeypatch.setattr(device_util, "set_device", selected_devices.append)
+    monkeypatch.setattr(device_util, "get_torch_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr(device_util, "visible_devices_env_names", lambda: [])
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "")
+
+    reader._set_device()
+
+    assert selected_devices == [8]
+    assert reader.barrier_device == 8
+    assert reader.backend == reader.comm_backend
