@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import pytest
 import torch
 from transformers import PretrainedConfig
 
 from awex.config import InferenceConfig
 from awex.converter.vllm_converter import VLLMToHFWeightConverter
+from awex.models.ascend.qwen3_5 import VLLMToHFWeightConverterQwen3VL
 from awex.sharding.rank_info import RankInfo
 
 
@@ -85,3 +87,36 @@ def test_glm4v_proj_mapping():
     name = "model.layers.0.self_attn.proj.weight"
     converted = converter.convert_param(name, weight)
     assert converted == [("model.layers.0.attention.dense.weight", weight)]
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        (
+            "model.layers.0.mlp.experts.routed_experts.w13_weight",
+            "model.layers.0.mlp.experts.w13_weight",
+        ),
+        (
+            "model.layers.47.mlp.experts.routed_experts.w2_weight",
+            "model.layers.47.mlp.experts.w2_weight",
+        ),
+        (
+            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale_inv",
+            "model.layers.0.mlp.experts.w13_weight_scale_inv",
+        ),
+        (
+            "model.layers.0.mlp.experts.w13_weight",
+            "model.layers.0.mlp.experts.w13_weight",
+        ),
+        (
+            "model.layers.0.mlp.shared_experts.gate_proj.weight",
+            "model.layers.0.mlp.shared_experts.gate_proj.weight",
+        ),
+    ],
+)
+def test_nested_expert_name_normalization(name, expected):
+    assert _make_converter()._normalize_name(name) == expected
+    qwen_converter = VLLMToHFWeightConverterQwen3VL.__new__(
+        VLLMToHFWeightConverterQwen3VL
+    )
+    assert qwen_converter._normalize_name(name) == expected
