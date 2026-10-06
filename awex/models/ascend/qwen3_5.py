@@ -1039,6 +1039,7 @@ class VLLMToHFWeightConverterQwen3VL(
             (".self_attn.proj", ".attention.dense"),
             (".self_attn.q_norm", ".attention.query_layernorm"),
             (".self_attn.k_norm", ".attention.key_layernorm"),
+            (".experts.routed_experts.", ".experts."),
         ]
         for old, new in replacements:
             if old in name:
