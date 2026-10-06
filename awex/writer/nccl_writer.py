@@ -184,30 +184,17 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             f"Func _init_writer_in_colocate_mode got ipc from infer is {self.ipc_backend=}."
         )
 
-        device_phy_ids = [str(i) for i in range(8)]
-        visible_env_key = "CUDA_VISIBLE_DEVICES"
-        if device_util.get_device_type() == "npu":
-            device_phy_ids = [str(i) for i in range(16)]
-            visible_env_key = "ASCEND_RT_VISIBLE_DEVICES"
-
         # Don't get IPC tensors here since every step, the memory address for weights will change
         # because we use offloading for moving GPU tensors to CPU and back later
         ip_address = get_ip_address()
         self._set_device()
-
-        def _get_current_phy_id():
-            device_phy_id = os.getenv(visible_env_key)
-            if device_phy_id in device_phy_ids:
-                return device_phy_id
-            ids = device_phy_id.split(",")
-            gpu_id = int(os.environ.get("LOCAL_RANK", 0))
-            current_phy_id = ids[gpu_id]
-            logger.info(
-                f"_get_current_phy_id:{current_phy_id=} {gpu_id=} {ids=} {os.environ.get('LOCAL_RANK', 0)=}"
-            )
-            return current_phy_id
-
-        device_id = _get_current_phy_id()
+        device_id = device_util.current_physical_device_id()
+        logger.info(
+            "Resolved training physical device: current=%s visible=%s physical=%s",
+            device_util.current_device(),
+            device_util.visible_devices_env_value() or "(unset)",
+            device_id,
+        )
         self.meta_server_client.add_object_to_set(
             "training_device_rank_entries", (ip_address, device_id, self.transfer_rank)
         )
