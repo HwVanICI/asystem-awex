@@ -152,6 +152,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         if self.already_initialized:
             return
 
+        if self.destroy_pg_after_update and self.comm_backend == "hccl":
+            # HCCL allocates outside PyTorch's caching allocator. Checkpoint
+            # export can leave large inactive blocks that its buffers cannot use.
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
+
         self.weights_update_group = init_weights_update_group(
             master_address=self.master_address,
             master_port=self.master_port,
@@ -171,10 +177,17 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
 
     def _destroy_weights_exchange_process_group(self):
         # reduce the impact of process group to avoid oom in infer
-        if self.destroy_pg_after_update and self.backend == "hccl":
-            self.already_initialized = False
-            torch.distributed.destroy_process_group(self.weights_update_group)
+        if (
+            self.destroy_pg_after_update
+            and self.comm_backend == "hccl"
+            and self.already_initialized
+        ):
             torch.npu.synchronize()
+            torch.distributed.destroy_process_group(self.weights_update_group)
+            # Unregistering the group alone leaves this reference alive, retaining
+            # its HCCL communicators and device queue resources until the next update.
+            self.weights_update_group = None
+            self.already_initialized = False
             torch.npu.empty_cache()
 
     def _init_writer_in_colocate_mode(self):

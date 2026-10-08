@@ -195,6 +195,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
     def _init_weights_exchange_process_group(self):
         if self.already_initialized:
             return
+
+        if self.destroy_pg_after_update and self.backend == "hccl":
+            # Reclaim inactive PyTorch blocks before native HCCL buffer allocation.
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
         from awex.util.process_group import (
             init_weights_update_group,
         )
@@ -218,10 +223,17 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
 
     def _destroy_weights_exchange_process_group(self):
         # reduce the impact of process group to avoid oom in infer
-        if self.destroy_pg_after_update and self.backend == "hccl":
-            self.already_initialized = False
-            torch.distributed.destroy_process_group(self.weights_update_group)
+        if (
+            self.destroy_pg_after_update
+            and self.backend == "hccl"
+            and self.already_initialized
+        ):
             torch.npu.synchronize()
+            torch.distributed.destroy_process_group(self.weights_update_group)
+            # Release the last local group reference so device queue resources
+            # are available to training and checkpoint collectives between updates.
+            self.weights_update_group = None
+            self.already_initialized = False
             torch.npu.empty_cache()
 
     def _init_reader_in_colocate_mode(self):
