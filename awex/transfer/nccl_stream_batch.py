@@ -168,8 +168,8 @@ class NcclColocateStreamBatchTransport:
         hang_detector.submit(detect_hang, future, msg, [], timeout=60)
 
         # Execute recursive partition transfer
-        # FIXME: batch_isend_irecv hang sometimes, seems `batch_isend_irecv` can't handle asymmetric p2p communication.
-        # so we use send/recv directly
+        # NPU batches keep complementary phases and one operation per peer,
+        # avoiding an asymmetric mixture of all send/receive operations.
         self.execute_recursive_partition_stream_transfer(
             transfer_rank,
             world_size,
@@ -308,7 +308,7 @@ class NcclColocateStreamBatchTransport:
         peer_ops_with_rank = []
         active_peer_ranks = []
         for peer_rank in peer_ranks:
-            if peer_rank in ops_dict:
+            if ops_dict.get(peer_rank):
                 peer_ops_with_rank.append((peer_rank, ops_dict[peer_rank]))
                 active_peer_ranks.append(peer_rank)
 
@@ -325,18 +325,22 @@ class NcclColocateStreamBatchTransport:
         # Find the maximum number of ops across all peers
         max_ops = max(len(ops) for _, ops in peer_ops_with_rank)
         total_ops = 0
+        first_op = peer_ops_with_rank[0][1][0][1]
+        use_batch = (
+            first_op.tensor.device.type == "npu"
+            and first_op.op in (dist.isend, dist.irecv)
+            and os.getenv("AWEX_USE_BATCH_SEND_RECV", "1") == "1"
+        )
 
         # Execute ops in round-robin fashion: one op from each peer per iteration
         # This allows concurrent execution across multiple peers
         work_handles = []
         for op_idx in range(max_ops):
             recv_buffers = []
+            batch_ops = []
             for peer_rank, ops in peer_ops_with_rank:
                 if op_idx < len(ops):
                     _, p2p_op = ops[op_idx]
-                    # Use the stream allocated to this peer to maintain ordering
-                    stream_idx = peer_to_stream_idx[peer_rank]
-                    stream = self._stream_pool[stream_idx]
                     tensor = p2p_op.tensor
                     if (
                         p2p_op.op in (dist.irecv, dist.recv)
@@ -346,23 +350,36 @@ class NcclColocateStreamBatchTransport:
                             tensor, memory_format=torch.contiguous_format
                         )
                         recv_buffers.append((p2p_op.tensor, tensor))
-                    with device_util.stream(stream):
-                        result = p2p_op.op(tensor, p2p_op.peer, group=p2p_op.group)
-                        if p2p_op.op is dist.isend or p2p_op.op is dist.irecv:
-                            work_handles.append(result)
-                        del result
+                    if use_batch:
+                        batch_ops.append(
+                            dist.P2POp(
+                                p2p_op.op, tensor, p2p_op.peer, group=p2p_op.group
+                            )
+                        )
+                    else:
+                        stream = self._stream_pool[peer_to_stream_idx[peer_rank]]
+                        with device_util.stream(stream):
+                            result = p2p_op.op(tensor, p2p_op.peer, group=p2p_op.group)
+                            if p2p_op.op is dist.isend or p2p_op.op is dist.irecv:
+                                work_handles.append(result)
+                            del result
                     total_ops += 1
 
-            if recv_buffers:
+            if batch_ops:
+                work_handles.extend(dist.batch_isend_irecv(batch_ops))
+
+            if recv_buffers or batch_ops:
                 # Retain at most one staging buffer per active receive peer.
                 while work_handles:
                     work_handles.pop().wait()
                 device_util.synchronize()
-                for original, received in recv_buffers:
-                    original.copy_(received)
-                device_util.synchronize()
-                recv_buffers.clear()
-                del original, received, tensor
+                if recv_buffers:
+                    for original, received in recv_buffers:
+                        original.copy_(received)
+                    device_util.synchronize()
+                    recv_buffers.clear()
+                    del original, received
+                del tensor
 
         # Wait for all async operations to complete
         for work in work_handles:
