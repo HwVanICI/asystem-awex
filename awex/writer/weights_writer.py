@@ -122,6 +122,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         self.timeout = 10000
         self.initialized = False
         self.num_infer_engines = None
+        self._colocate_control_group = None
         self.engine_name = train_engine.engine_name
         self.enable_mem_debug = os.environ.get("AWEX_MEM_DEBUG", "0") == "1"
         self.already_initialized = False
@@ -320,6 +321,9 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                 raise e
 
     def _release_memory_for_weights_exchange(self):
+        if self._colocate_control_group is None:
+            # Device barriers can contend with inference on colocated chips.
+            self._colocate_control_group = dist.new_group(backend="gloo")
         if self.num_infer_engines is None:
             logger.info("Start to get number of inference engines from meta server")
             # first time, the inference engine is not initialized, so we need to wait for it to be initialized
@@ -337,7 +341,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             )
         self.train_engine.release_memory_occupation(tags=["optimizer"])
         self.train_engine.resume_memory_occupation(tags=["weights"])
-        dist.barrier()
+        dist.barrier(group=self._colocate_control_group)
         if dist.get_rank() == 0:
             self.meta_server_client.add_object_to_set(
                 "all_training_offloaded_optimizers", dist.get_rank()
@@ -355,7 +359,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         logger.info(
             "All inference engines have finished weights update, start to release weights memory occupation"
         )
-        dist.barrier()
+        dist.barrier(group=self._colocate_control_group)
         if dist.get_rank() == 0:
             self.meta_server_client.delete_if_exists("finished_weights_update_engines")
             self.meta_server_client.delete_if_exists(
