@@ -129,3 +129,46 @@ def test_colocate_noncontiguous_receives_copy_back_with_bounded_buffers(monkeypa
             torch.testing.assert_close(
                 target, torch.full_like(target, peer + 1), rtol=0, atol=0
             )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_colocate_npu_respects_batch_send_recv_flag(monkeypatch, enabled):
+    """Fused P2P avoids individual peer calls; the escape hatch remains."""
+    monkeypatch.setenv("AWEX_USE_BATCH_SEND_RECV", "1" if enabled else "0")
+    direct_calls, batches = [], []
+
+    def send(tensor, peer, group):
+        direct_calls.append(peer)
+        return SimpleNamespace(wait=lambda: None)
+
+    def batch(ops):
+        batches.append([op.peer for op in ops])
+        return [SimpleNamespace(tensors=[op.tensor for op in ops], wait=lambda: None)]
+
+    def operation(op, tensor, peer, group):
+        return SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group)
+
+    monkeypatch.setattr(transport_module.dist, "isend", send)
+    monkeypatch.setattr(transport_module.dist, "batch_isend_irecv", batch)
+    monkeypatch.setattr(transport_module.dist, "P2POp", operation)
+    monkeypatch.setattr(transport_module.device_util, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(transport_module.device_util, "synchronize", lambda: None)
+    transport = object.__new__(transport_module.NcclColocateStreamBatchTransport)
+    transport._stream_pool = [None, None]
+    tensor = SimpleNamespace(
+        device=SimpleNamespace(type="npu"), is_contiguous=lambda: True
+    )
+    ops = {
+        peer: [(None, operation(send, tensor, peer, None)) for _ in range(2)]
+        for peer in (1, 2)
+    }
+    ops[0] = []
+
+    assert transport._execute_ops_concurrent(ops, range(3)) == 4
+    assert batches == ([[1, 2], [1, 2]] if enabled else [])
+    assert direct_calls == ([] if enabled else [1, 2, 1, 2])
+
+
+def test_colocate_empty_peer_operations_returns_zero():
+    transport = object.__new__(transport_module.NcclColocateStreamBatchTransport)
+    assert transport._execute_ops_concurrent({0: []}, [0]) == 0
