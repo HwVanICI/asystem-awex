@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import weakref
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -89,3 +91,47 @@ def test_colocate_fanout_reuses_snapshot_without_aliasing_source(
     assert first.is_contiguous()
     torch.testing.assert_close(first, expected, rtol=0, atol=0)
     torch.testing.assert_close(captured[2][1][1].tensor, expected[:1], rtol=0, atol=0)
+
+
+def test_colocate_noncontiguous_receives_copy_back_with_bounded_buffers(monkeypatch):
+    """Wait before copying back, and release staging tensors between rows."""
+    targets = [torch.zeros(3, 4).t() for _ in range(6)]
+    live_buffers = []
+    completed = []
+    peak = 0
+
+    def receive(tensor, peer, group):
+        nonlocal peak
+        assert tensor.is_contiguous()
+        live_buffers.append(weakref.ref(tensor))
+        peak = max(peak, sum(ref() is not None for ref in live_buffers))
+
+        def wait():
+            tensor.fill_(peer + 1)
+            completed.append(peer)
+
+        return SimpleNamespace(tensor=tensor, wait=wait)
+
+    monkeypatch.setattr(transport_module.dist, "irecv", receive)
+    monkeypatch.setattr(transport_module.device_util, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(transport_module.device_util, "synchronize", lambda: None)
+    transport = object.__new__(transport_module.NcclColocateStreamBatchTransport)
+    transport._stream_pool = [None, None]
+    ops = {
+        peer: [
+            (None, SimpleNamespace(op=receive, tensor=t, peer=peer, group=None))
+            for t in targets[peer * 3 : (peer + 1) * 3]
+        ]
+        for peer in range(2)
+    }
+
+    assert transport._execute_ops_concurrent(ops, range(2)) == 6
+
+    assert sorted(completed) == [0, 0, 0, 1, 1, 1]
+    assert peak == 2
+    assert all(ref() is None for ref in live_buffers)
+    for peer in range(2):
+        for target in targets[peer * 3 : (peer + 1) * 3]:
+            torch.testing.assert_close(
+                target, torch.full_like(target, peer + 1), rtol=0, atol=0
+            )

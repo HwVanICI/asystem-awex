@@ -89,7 +89,6 @@ class NcclColocateStreamBatchTransport:
         tensors_to_copy = []
         train_slice_context = {}
         send_snapshots = {}
-        non_contiguous_tensor_pairs = []
 
         # Process send operations
         for peer_rank, ops in send_ops.items():
@@ -141,10 +140,6 @@ class NcclColocateStreamBatchTransport:
             for op in ops:
                 recv_tensor = recv_parameters[op.recv_shard_meta.name]
                 tensor_sliced = slice_tensor(recv_tensor, op, False)
-                if not tensor_sliced.is_contiguous():
-                    original_tensor = tensor_sliced
-                    tensor_sliced = tensor_sliced.contiguous()
-                    non_contiguous_tensor_pairs.append((original_tensor, tensor_sliced))
                 p2p_op = dist.P2POp(
                     dist.irecv if async_op else dist.recv,
                     tensor_sliced,
@@ -184,12 +179,6 @@ class NcclColocateStreamBatchTransport:
             rank_coordinate,
             step_id,
         )
-        if non_contiguous_tensor_pairs:
-            with torch.no_grad():
-                for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
-                    original_tensor.copy_(recv_tensor)
-                non_contiguous_tensor_pairs.clear()
-                del non_contiguous_tensor_pairs
         device_util.synchronize()
         future.set_result(True)
         duration = time.time() - start_time
@@ -341,19 +330,39 @@ class NcclColocateStreamBatchTransport:
         # This allows concurrent execution across multiple peers
         work_handles = []
         for op_idx in range(max_ops):
+            recv_buffers = []
             for peer_rank, ops in peer_ops_with_rank:
                 if op_idx < len(ops):
                     _, p2p_op = ops[op_idx]
                     # Use the stream allocated to this peer to maintain ordering
                     stream_idx = peer_to_stream_idx[peer_rank]
                     stream = self._stream_pool[stream_idx]
-                    with device_util.stream(stream):
-                        result = p2p_op.op(
-                            p2p_op.tensor, p2p_op.peer, group=p2p_op.group
+                    tensor = p2p_op.tensor
+                    if (
+                        p2p_op.op in (dist.irecv, dist.recv)
+                        and not tensor.is_contiguous()
+                    ):
+                        tensor = torch.empty_like(
+                            tensor, memory_format=torch.contiguous_format
                         )
+                        recv_buffers.append((p2p_op.tensor, tensor))
+                    with device_util.stream(stream):
+                        result = p2p_op.op(tensor, p2p_op.peer, group=p2p_op.group)
                         if p2p_op.op is dist.isend or p2p_op.op is dist.irecv:
                             work_handles.append(result)
+                        del result
                     total_ops += 1
+
+            if recv_buffers:
+                # Retain at most one staging buffer per active receive peer.
+                while work_handles:
+                    work_handles.pop().wait()
+                device_util.synchronize()
+                for original, received in recv_buffers:
+                    original.copy_(received)
+                device_util.synchronize()
+                recv_buffers.clear()
+                del original, received, tensor
 
         # Wait for all async operations to complete
         for work in work_handles:
