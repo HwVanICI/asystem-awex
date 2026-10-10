@@ -88,6 +88,7 @@ class NcclColocateStreamBatchTransport:
         all_recv_p2p_ops = {}  # peer_rank -> List[(plan_op, p2p_op)]
         tensors_to_copy = []
         train_slice_context = {}
+        send_snapshots = {}
         non_contiguous_tensor_pairs = []
 
         # Process send operations
@@ -107,16 +108,23 @@ class NcclColocateStreamBatchTransport:
                 p2p_ops = []
                 for op in ops:
                     send_tensor = send_parameters[op.send_shard_meta.name]
-                    tensor_sliced = slice_tensor(
-                        send_tensor, op, True, slice_context=train_slice_context
-                    )
                     # Use mapped inference rank for P2P operation
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
                     )
+                    # Reuse immutable fan-out snapshots; self-copy must not
+                    # overwrite source data before remote sends complete.
+                    snapshot_key = (
+                        op.send_shard_meta.name,
+                        tuple((s.start, s.stop, s.step) for s in op.train_slices),
+                    )
+                    if snapshot_key not in send_snapshots:
+                        send_snapshots[snapshot_key] = send_tensor[
+                            op.train_slices
+                        ].clone(memory_format=torch.contiguous_format)
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
-                        tensor_sliced.clone(),
+                        send_snapshots[snapshot_key],
                         recv_rank,
                         group=weights_update_group,
                     )
