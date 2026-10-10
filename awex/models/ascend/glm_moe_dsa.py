@@ -61,6 +61,10 @@ def _rope_dim(config) -> int:
 
 
 class GLMMoeDSAShardingStrategy(LinearMLAShardingMixin, ShardingStrategy):
+    def get_shared_expert_sharding_strategy(self, parameter_name, **kwargs):
+        # GLM's shared expert is a TP-sharded MLP, not a routed EP expert.
+        return self.get_mlp_sharding_strategy(parameter_name, **kwargs)
+
     def get_sharding_strategy(self, parameter_name, **kwargs):
         # DSA indexer heads are replicated on both sides, not split by attention TP.
         if ".attention.indexer." in parameter_name:
