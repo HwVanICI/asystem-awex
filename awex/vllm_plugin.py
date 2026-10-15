@@ -174,7 +174,6 @@ def _get_awex_adapter(raw_request):
 def _patch_awex_worker() -> None:
     try:
         from vllm.distributed.parallel_state import (
-            get_dp_group,
             get_ep_group,
             get_pp_group,
             get_tp_group,
@@ -203,13 +202,11 @@ def _patch_awex_worker() -> None:
             pp_size = pp_group.world_size
         except AssertionError:
             pp_rank, pp_size = 0, 1
-        try:
-            dp_group = get_dp_group()
-            dp_rank = dp_group.rank_in_group
-            dp_size = dp_group.world_size
-        except AssertionError:
-            dp_rank = parallel_config.data_parallel_rank
-            dp_size = parallel_config.data_parallel_size
+        dp_rank = parallel_config.data_parallel_index
+        dp_size = parallel_config.data_parallel_size
+        # Dense EngineCores reset DP rank/size to 0/1, but retain their index.
+        if infer_engine_config is not None and infer_engine_config.dp_size is not None:
+            dp_size = infer_engine_config.dp_size
         try:
             ep_group = get_ep_group()
             ep_rank = ep_group.rank_in_group
@@ -259,7 +256,7 @@ def _patch_awex_worker() -> None:
             "ep_tp_size": 1,
             "local_rank": reported_local_rank,
             "global_rank": global_rank,
-            "world_size": parallel_config.world_size_across_dp,
+            "world_size": dp_size * local_world_size,
             # engine_rank is AWEX external instance index, not vLLM internal DP rank.
             "engine_rank": external_engine_rank,
             "is_infer": True,
@@ -329,6 +326,8 @@ def _patch_awex_worker() -> None:
                 if value is not None:
                     setattr(merged, field, value)
             base_config = merged
+            # Reader initialization has no explicit config; reuse the server's DP size.
+            self._awex_infer_engine_config = merged
         model_context = _awex_rank_info(self, base_config)
         model_context["scheduler"] = self
         model_context["infer_engine_config"] = base_config
