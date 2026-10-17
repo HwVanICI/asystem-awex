@@ -248,20 +248,26 @@ def init_weights_update_group(
 
 
 def setup_batch_isend_irecv(
-    process_group, rank, world_size, tensor_size=10 * 10, dtype=torch.float32
+    process_group,
+    rank,
+    world_size,
+    tensor_size=10 * 10,
+    dtype=torch.float32,
+    use_batch=True,
 ):
     """
-    Perform a simple communication using batch_isend_irecv to avoid the hang for later sub-ranks.
+    Warm up P2P communication, respecting the selected batch/non-batch transport.
 
     Args:
     process_group (ProcessGroup): The process group to work on.
     tensor_size (int): Size of the tensor to send/receive.
     dtype (torch.dtype): Data type of the tensor.
+    use_batch (bool): Whether batch_isend_irecv is allowed.
     """
     assert process_group is not None, "Process group cannot be None"
     device = device_util.current_device()
     logger.info(
-        f"Setup batch isend irecv for rank {rank} world size {world_size} device {device}"
+        f"Setup P2P warmup for rank {rank} world size {world_size} device {device}, use_batch={use_batch}"
     )
 
     # Create tensors for sending and receiving
@@ -304,9 +310,12 @@ def setup_batch_isend_irecv(
         ops.append(dist.P2POp(dist.irecv, recv_tensor, recv_from, group=process_group))
         ops.append(dist.P2POp(dist.isend, send_tensor, send_to, group=process_group))
 
-    # Execute batch_isend_irecv
+    # Execute the selected P2P transport.
     if ops:
-        reqs = dist.batch_isend_irecv(ops)
+        if use_batch:
+            reqs = dist.batch_isend_irecv(ops)
+        else:
+            reqs = [op.op(op.tensor, op.peer, group=op.group, tag=op.tag) for op in ops]
         # Wait for all communications to complete
         for req in reqs:
             req.wait()

@@ -159,7 +159,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 group=self.weights_update_group,
             )
         setup_batch_isend_irecv(
-            self.weights_update_group, self.transfer_rank, self.world_size
+            self.weights_update_group,
+            self.transfer_rank,
+            self.world_size,
+            use_batch=self.use_batch_send_recv,
         )
 
     def _set_device(self):
