@@ -134,7 +134,10 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 f"NCCL ready: send tensor to rank {self.transfer_world_size - 1} from rank {self.transfer_rank}"
             )
         setup_batch_isend_irecv(
-            self.weights_update_group, self.transfer_rank, self.transfer_world_size
+            self.weights_update_group,
+            self.transfer_rank,
+            self.transfer_world_size,
+            use_batch=self.use_batch_send_recv,
         )
 
     def _set_device(self):
