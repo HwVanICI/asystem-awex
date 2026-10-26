@@ -185,8 +185,8 @@ class AwexVLLMServerAdapter:
         rpc_client = self._get_dp_rpc_client()
 
         # Internal DP (DPLB) path: gather utility results from every core engine.
-        # This is needed for metadata collection where returning only the first
-        # core would drop shards that exist on other DP cores.
+        # Metadata and weight verification must not drop shards or failures
+        # from the other DP cores.
         if not (
             rpc_client is not None
             and hasattr(rpc_client, "core_engines")
@@ -257,14 +257,15 @@ class AwexVLLMServerAdapter:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     @staticmethod
-    def _is_meta_collection_call(method: str, payload: dict) -> bool:
-        if method == "_get_model_param_info":
+    def _requires_all_dp_results(method: str, payload: dict) -> bool:
+        tasks = ("_get_model_param_info", "_verify_weights_on_tp_worker")
+        if method in tasks:
             return True
         if method != "awex_execute":
             return False
         task_qualname = payload.get("task_qualname", "")
-        return isinstance(task_qualname, str) and task_qualname.endswith(
-            "_get_model_param_info"
+        return (
+            isinstance(task_qualname, str) and task_qualname.rsplit(".", 1)[-1] in tasks
         )
 
     def execute_task_in_model_worker(self, fn, **kwargs):
@@ -284,7 +285,7 @@ class AwexVLLMServerAdapter:
                 "task_qualname": fn.__qualname__,
                 "task_kwargs": kwargs,
             }
-        if self._is_meta_collection_call(method, payload):
+        if self._requires_all_dp_results(method, payload):
             core_results = self._collective_rpc_all_dp_cores(
                 method, args=(), kwargs=payload
             )
@@ -295,7 +296,7 @@ class AwexVLLMServerAdapter:
                 else:
                     merged_results.append(result)
             logger.info(
-                "Collected model param meta from %s DP core(s), merged %s entries.",
+                "Collected task results from %s DP core(s), merged %s entries.",
                 len(core_results),
                 len(merged_results),
             )

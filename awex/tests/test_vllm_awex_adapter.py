@@ -1,5 +1,8 @@
 import types
 
+import pytest
+
+from awex.reader.weights_reader import WeightsReader
 from awex.vllm_awex_adapter import AwexVLLMServerAdapter
 
 
@@ -116,3 +119,21 @@ def test_meta_collection_without_dp_core_falls_back_to_collective_rpc():
 
     assert results == [{"source": "collective_rpc", "method": "_get_model_param_info"}]
     assert len(adapter._engine_client.collective_calls) == 1
+
+
+def test_validation_failure_on_second_dp_core_is_not_dropped():
+    adapter = _build_adapter(with_dp_cores=True)
+
+    def _verify(utility_method, *args, engine=None):
+        return [{"weight": engine != b"dp1"}]
+
+    adapter._engine_client._call_utility_async = _verify
+    reader = object.__new__(WeightsReader)
+    reader.validated_steps = 0
+    reader.weights_validation_steps = 1
+    reader.validate_weights_every_n_steps = 1
+    reader.inference_engine = adapter
+    reader.raise_on_validation_fail = True
+
+    with pytest.raises(RuntimeError, match="1 inconsistent weights"):
+        reader._validate_weights(0)

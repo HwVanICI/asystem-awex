@@ -488,7 +488,7 @@ class WeightsReader(WeightExchangeReader):
         )
         all_ok = True
         total_bad = 0
-        for tp_rank, tp_results in enumerate(verify_results):
+        for worker_index, tp_results in enumerate(verify_results):
             if not all(tp_results.values()):
                 not_consistent_weights = [
                     name for name, result in tp_results.items() if not result
@@ -496,17 +496,17 @@ class WeightsReader(WeightExchangeReader):
                 total_bad += len(not_consistent_weights)
                 all_ok = False
                 logger.error(
-                    f"Weights for step {step_id} is not consistent for tp rank {tp_rank}: {not_consistent_weights}, "
+                    f"Weights for step {step_id} is not consistent for worker index {worker_index}: {not_consistent_weights}, "
                     f"total {len(tp_results)} weights"
                 )
             else:
                 logger.info(
-                    f"Weights for step {step_id} is consistent for tp rank {tp_rank}, "
+                    f"Weights for step {step_id} is consistent for worker index {worker_index}, "
                     f"total {len(tp_results)} weights"
                 )
         if all_ok:
             logger.info(
-                f"[Validation] step {step_id} PASSED across {len(verify_results)} tp ranks"
+                f"[Validation] step {step_id} PASSED across {len(verify_results)} worker ranks"
             )
         else:
             logger.error(
