@@ -993,6 +993,50 @@ class VLLMToHFWeightConverterQwen3VL(
         rank_info,
     ):
         super().__init__(model_config.text_config, infer_engine_config, rank_info)
+        self._runtime_copies = []
+
+    def iter_model_parameters(self, model):
+        """Exchange canonical weights and retain Ascend kernel copies for refresh."""
+        self._runtime_copies = []
+        derived_names = set()
+        for prefix, module in model.named_modules():
+            if prefix.endswith(".mlp.gate"):
+                destination = getattr(module, "weight_fp32", None)
+                if destination is not None:
+                    source = module.weight
+                    if (
+                        destination.shape != source.shape
+                        or destination.dtype != torch.float32
+                    ):
+                        raise ValueError(f"Unsupported Ascend router layout: {prefix}")
+                    self._runtime_copies.append((destination, source))
+                    derived_names.add(prefix + ".weight_fp32")
+            if ".linear_attn.conv1d" not in prefix:
+                continue
+            destination = getattr(module, "ascend_conv1d_weight", None)
+            if destination is None:
+                continue
+            source = module.weight
+            if (
+                source.ndim != 3
+                or source.shape[1] != 1
+                or destination.shape != (source.shape[2], source.shape[0])
+            ):
+                raise ValueError(f"Unsupported Ascend GDN convolution layout: {prefix}")
+            self._runtime_copies.append(
+                (destination, source.squeeze(1).transpose(0, 1))
+            )
+            derived_names.add(prefix + ".ascend_conv1d_weight")
+        for name, parameter in super().iter_model_parameters(model):
+            if name not in derived_names:
+                yield name, parameter
+
+    @torch.no_grad()
+    def post_update_weights(self):
+        super().post_update_weights()
+        for destination, source in self._runtime_copies:
+            # Preserve addresses referenced by captured inference graphs.
+            destination.copy_(source)
 
     def _fuse_qkv(self, name: str) -> bool:
         return True

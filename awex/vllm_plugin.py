@@ -31,9 +31,12 @@ logger = logging.getLogger(__name__)
 # Newer vLLM moved OpenAIBaseModel and removed the shared module-level router.
 # Try new paths first, fall back to legacy.
 try:
-    from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
 except ImportError:
-    from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+    try:
+        from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    except ImportError:
+        from vllm.entrypoints.openai.protocol import OpenAIBaseModel
 
 try:
     from vllm.entrypoints.openai.api_server import router  # type: ignore[attr-defined]
@@ -421,10 +424,13 @@ def _ensure_router_attached() -> None:
     if _USING_LEGACY_VLLM_ROUTER or _awex_build_app_patched:
         return
     try:
-        from vllm.entrypoints.openai import api_server as _api_server_module
+        from vllm.entrypoints.launchers.api_server import entry as _api_server_module
     except ImportError as exc:
-        logger.warning("Cannot patch vLLM build_app for Awex routes: %s", exc)
-        return
+        try:
+            from vllm.entrypoints.openai import api_server as _api_server_module
+        except ImportError:
+            logger.warning("Cannot patch vLLM build_app for Awex routes: %s", exc)
+            return
     original_build_app = getattr(_api_server_module, "build_app", None)
     if original_build_app is None:
         logger.warning(
