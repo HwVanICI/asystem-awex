@@ -128,3 +128,81 @@ def test_invalid_router_layout_is_rejected(converter, layout):
     )
     with pytest.raises(ValueError, match="Unsupported Ascend router layout"):
         list(converter.iter_model_parameters(model))
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("stage", ["single", "first", "last"])
+def test_tied_head_metadata_and_reader_agree(converter, monkeypatch, tied, stage):
+    from awex.meta import infer_meta_resolver
+    from awex.reader.weights_reader import WorkerWeightsReader
+
+    model = nn.Module()
+    model.language_model = nn.Module()
+    language_model = model.language_model
+    language_model.model = nn.Module()
+    # Tied vLLM models retain embeddings on the last pipeline stage too.
+    has_embedding = stage != "last" or tied
+    has_head = stage != "first"
+    if has_embedding:
+        language_model.model.embed_tokens = nn.Embedding(4, 2)
+    if has_head:
+        language_model.lm_head = nn.Linear(2, 4, bias=False)
+        if tied:
+            language_model.lm_head.weight = language_model.model.embed_tokens.weight
+    model.config = SimpleNamespace(tie_word_embeddings=tied)
+    rank_info = SimpleNamespace(
+        pp_rank=int(stage == "last"),
+        pp_size=1 if stage == "single" else 2,
+        global_rank=0,
+    )
+    monkeypatch.setattr(
+        infer_meta_resolver,
+        "get_rank_info_extractor",
+        lambda _: lambda *args: rank_info,
+    )
+    monkeypatch.setattr(
+        infer_meta_resolver,
+        "get_infer_weights_converter",
+        lambda *args, **kwargs: converter,
+    )
+    meta = infer_meta_resolver.InferParamMetaResolver._get_model_param_info(
+        "vllm",
+        InferenceConfig(),
+        convert_params=True,
+        model=model,
+        model_context={"pp_rank": rank_info.pp_rank, "pp_size": rank_info.pp_size},
+    )
+    reader = SimpleNamespace(
+        model=model,
+        weight_converter=converter,
+        hf_config=model.config,
+        rank_info=rank_info,
+    )
+    WorkerWeightsReader.initialize(reader)
+    expected = set()
+    if has_embedding:
+        expected.add("model.language_model.embed_tokens.weight")
+    if has_head:
+        expected.add("lm_head.weight")
+    names = [param["name"] for param in meta["params_meta"]]
+    assert set(names) == expected
+    assert len(names) == len(expected)
+    assert set(reader.parameters) == expected
+    if has_head:
+        head = reader.parameters["lm_head.weight"]
+        assert head is language_model.lm_head.weight
+        if has_embedding:
+            embedding = reader.parameters["model.language_model.embed_tokens.weight"]
+            assert (head is embedding) == tied
+        pointer = head.data_ptr()
+        with torch.no_grad():
+            for value in (2.0, 5.0):
+                head.copy_(torch.full_like(head, value))
+                converter.post_update_weights()
+                assert head.data_ptr() == pointer
+                torch.testing.assert_close(
+                    language_model.lm_head.weight,
+                    torch.full_like(head, value),
+                    rtol=0,
+                    atol=0,
+                )

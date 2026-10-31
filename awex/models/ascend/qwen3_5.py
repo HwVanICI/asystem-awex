@@ -1027,7 +1027,8 @@ class VLLMToHFWeightConverterQwen3VL(
                 (destination, source.squeeze(1).transpose(0, 1))
             )
             derived_names.add(prefix + ".ascend_conv1d_weight")
-        for name, parameter in super().iter_model_parameters(model):
+        # Keep tied head names for both metadata and receiving tensors.
+        for name, parameter in model.named_parameters(remove_duplicate=False):
             if name not in derived_names:
                 yield name, parameter
 
